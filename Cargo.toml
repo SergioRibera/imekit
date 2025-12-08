@@ -6,7 +6,7 @@ authors = ["Sergio Ribera"]
 license = "MIT OR Apache-2.0"
 description = "A cross-platform Rust library for IME (Input Method Engine) integration using native protocols"
 repository = "https://github.com/SergioRibera/ime-test"
-keywords = ["ime", "input-method", "wayland", "x11", "tsf", "imk"]
+keywords = ["ime", "input-method", "tsf", "imk"]
 categories = ["os", "gui", "text-processing"]
 readme = "README.md"
 
