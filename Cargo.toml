@@ -1,0 +1,54 @@
+[package]
+name = "imekit"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sergio Ribera"]
+license = "MIT OR Apache-2.0"
+description = "A cross-platform Rust library for IME (Input Method Engine) integration using native protocols"
+repository = "https://github.com/SergioRibera/ime-test"
+keywords = ["ime", "input-method", "wayland", "x11", "tsf", "imk"]
+categories = ["os", "gui", "text-processing"]
+readme = "README.md"
+
+[features]
+default = []
+log = ["dep:log"]
+tracing = ["dep:tracing"]
+ibus = ["zbus"]
+
+[[example]]
+name = "basic_ime"
+path = "examples/basic_ime.rs"
+
+[[example]]
+name = "commit_text"
+path = "examples/commit_text.rs"
+
+[dependencies]
+log = { version = "0.4", optional = true }
+tracing = { version = "0.1", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+x11rb = { version = "0.13", features = ["allow-unsafe-code", "xtest"] }
+zbus = { version = "5", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_UI_TextServices",
+    "Win32_System_Com",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSRange"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSApplication", "NSEvent", "NSTextInputClient", "NSResponder"] }
+
+[dev-dependencies]
+env_logger = "0.11"

@@ -1,0 +1,14 @@
+target/
+Cargo.lock
+
+# MSVC Windows builds
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
