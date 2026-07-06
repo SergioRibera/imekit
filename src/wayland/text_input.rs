@@ -6,6 +6,7 @@
 //! This is the client-side of the text input protocol, used by applications
 //! that want to receive input from an IME.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use wayland_client::{
@@ -75,7 +76,7 @@ pub struct TextInputData {
     /// Whether text input is enabled
     enabled: bool,
     /// Pending events
-    events: Vec<TextInputEvent>,
+    events: VecDeque<TextInputEvent>,
     /// Current serial
     serial: u32,
 }
@@ -146,7 +147,7 @@ impl TextInput {
             .dispatch_pending(&mut *self.data.lock().unwrap());
 
         // Return the next event
-        self.data.lock().unwrap().events.pop()
+        self.data.lock().unwrap().events.pop_front()
     }
 
     /// Enable text input for a surface
@@ -336,38 +337,38 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for TextInputData {
         match event {
             zwp_text_input_v3::Event::Enter { surface: _ } => {
                 state.enabled = true;
-                state.events.push(TextInputEvent::Enter);
+                state.events.push_back(TextInputEvent::Enter);
             }
             zwp_text_input_v3::Event::Leave { surface: _ } => {
                 state.enabled = false;
-                state.events.push(TextInputEvent::Leave);
+                state.events.push_back(TextInputEvent::Leave);
             }
             zwp_text_input_v3::Event::PreeditString {
                 text,
                 cursor_begin,
                 cursor_end,
             } => {
-                state.events.push(TextInputEvent::PreeditString {
+                state.events.push_back(TextInputEvent::PreeditString {
                     text,
                     cursor_begin,
                     cursor_end,
                 });
             }
             zwp_text_input_v3::Event::CommitString { text } => {
-                state.events.push(TextInputEvent::CommitString { text });
+                state.events.push_back(TextInputEvent::CommitString { text });
             }
             zwp_text_input_v3::Event::DeleteSurroundingText {
                 before_length,
                 after_length,
             } => {
-                state.events.push(TextInputEvent::DeleteSurroundingText {
+                state.events.push_back(TextInputEvent::DeleteSurroundingText {
                     before_length,
                     after_length,
                 });
             }
             zwp_text_input_v3::Event::Done { serial } => {
                 state.serial = serial;
-                state.events.push(TextInputEvent::Done { serial });
+                state.events.push_back(TextInputEvent::Done { serial });
             }
             _ => {}
         }

@@ -3,6 +3,7 @@
 //! This module implements the `zwp_input_method_v2` protocol for Wayland.
 //! The protocol allows applications to act as input methods.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use wayland_client::{
@@ -41,7 +42,7 @@ pub struct InputMethodData {
     /// Current state
     state: InputMethodState,
     /// Pending events
-    events: Vec<InputMethodEvent>,
+    events: VecDeque<InputMethodEvent>,
     /// Count of `done` events received — must match the serial passed to `commit()`
     done_serial: u32,
     /// True between an `activate` event and the following `done` event
@@ -57,7 +58,7 @@ impl Default for InputMethodData {
             keyboard_grab: None,
             popup_surface: None,
             state: InputMethodState::new(),
-            events: Vec::new(),
+            events: VecDeque::new(),
             done_serial: 0,
             pending_activate: false,
         }
@@ -136,7 +137,7 @@ impl InputMethod {
             .dispatch_pending(&mut *self.data.lock().unwrap());
 
         // Return the next event
-        self.data.lock().unwrap().events.pop()
+        self.data.lock().unwrap().events.pop_front()
     }
 
     /// Dispatch events (blocking)
@@ -354,7 +355,7 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
                 state.state.active = false;
                 state.pending_activate = false;
                 state.state.reset();
-                state.events.push(InputMethodEvent::Deactivate);
+                state.events.push_back(InputMethodEvent::Deactivate);
             }
             zwp_input_method_v2::Event::SurroundingText {
                 text,
@@ -364,7 +365,7 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
                 state.state.surrounding_text = Some(text.clone());
                 state.state.cursor = cursor;
                 state.state.anchor = anchor;
-                state.events.push(InputMethodEvent::SurroundingText {
+                state.events.push_back(InputMethodEvent::SurroundingText {
                     text,
                     cursor,
                     anchor,
@@ -377,7 +378,7 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
                     _ => ChangeCause::Other,
                 };
                 state.state.change_cause = cause;
-                state.events.push(InputMethodEvent::TextChangeCause(cause));
+                state.events.push_back(InputMethodEvent::TextChangeCause(cause));
             }
             zwp_input_method_v2::Event::ContentType { hint, purpose } => {
                 // hint is WEnum<ContentHint> - we need to extract raw value
@@ -390,7 +391,7 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
 
                 state.state.content_hint = content_hint;
                 state.state.content_purpose = content_purpose;
-                state.events.push(InputMethodEvent::ContentType {
+                state.events.push_back(InputMethodEvent::ContentType {
                     hint: content_hint,
                     purpose: content_purpose,
                 });
@@ -400,14 +401,14 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
                 state.state.serial = state.done_serial;
                 if state.pending_activate {
                     state.pending_activate = false;
-                    state.events.push(InputMethodEvent::Activate {
+                    state.events.push_back(InputMethodEvent::Activate {
                         serial: state.done_serial,
                     });
                 }
-                state.events.push(InputMethodEvent::Done);
+                state.events.push_back(InputMethodEvent::Done);
             }
             zwp_input_method_v2::Event::Unavailable => {
-                state.events.push(InputMethodEvent::Unavailable);
+                state.events.push_back(InputMethodEvent::Unavailable);
             }
             _ => {}
         }
@@ -447,7 +448,7 @@ impl Dispatch<zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2, ()> for InputM
             height,
         } = event
         {
-            state.events.push(InputMethodEvent::PopupSurfaceCreated {
+            state.events.push_back(InputMethodEvent::PopupSurfaceCreated {
                 x,
                 y,
                 width,
