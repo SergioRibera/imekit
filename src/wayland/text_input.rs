@@ -152,18 +152,24 @@ impl TextInput {
 
     /// Enable text input for a surface
     pub fn enable(&mut self) {
-        let data = self.data.lock().unwrap();
-        if let Some(ti) = &data.text_input {
-            ti.enable();
+        {
+            let data = self.data.lock().unwrap();
+            if let Some(ti) = &data.text_input {
+                ti.enable();
+            }
         }
+        _ = self.connection.flush();
     }
 
     /// Disable text input
     pub fn disable(&mut self) {
-        let data = self.data.lock().unwrap();
-        if let Some(ti) = &data.text_input {
-            ti.disable();
+        {
+            let data = self.data.lock().unwrap();
+            if let Some(ti) = &data.text_input {
+                ti.disable();
+            }
         }
+        _ = self.connection.flush();
     }
 
     /// Set the surrounding text
@@ -197,10 +203,13 @@ impl TextInput {
 
     /// Commit changes
     pub fn commit(&self) {
-        let data = self.data.lock().unwrap();
-        if let Some(ti) = &data.text_input {
-            ti.commit();
+        {
+            let data = self.data.lock().unwrap();
+            if let Some(ti) = &data.text_input {
+                ti.commit();
+            }
         }
+        _ = self.connection.flush();
     }
 }
 
