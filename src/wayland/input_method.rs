@@ -42,6 +42,10 @@ pub struct InputMethodData {
     state: InputMethodState,
     /// Pending events
     events: Vec<InputMethodEvent>,
+    /// Count of `done` events received — must match the serial passed to `commit()`
+    done_serial: u32,
+    /// True between an `activate` event and the following `done` event
+    pending_activate: bool,
 }
 
 impl Default for InputMethodData {
@@ -54,6 +58,8 @@ impl Default for InputMethodData {
             popup_surface: None,
             state: InputMethodState::new(),
             events: Vec::new(),
+            done_serial: 0,
+            pending_activate: false,
         }
     }
 }
@@ -177,12 +183,17 @@ impl InputMethod {
 
     /// Commit all pending changes
     pub fn commit(&self, serial: u32) -> Result<()> {
-        let data = self.data.lock().unwrap();
-        if let Some(im) = &data.input_method {
-            im.commit(serial);
-            return Ok(());
+        {
+            let data = self.data.lock().unwrap();
+            if let Some(im) = &data.input_method {
+                im.commit(serial);
+            } else {
+                return Err(Error::NotActive);
+            }
         }
-        Err(Error::NotActive)
+        self.connection
+            .flush()
+            .map_err(|e| Error::CommitFailed(e.to_string()))
     }
 
     /// Grab the keyboard
@@ -337,13 +348,11 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
         match event {
             zwp_input_method_v2::Event::Activate => {
                 state.state.active = true;
-                state.state.serial += 1;
-                state.events.push(InputMethodEvent::Activate {
-                    serial: state.state.serial,
-                });
+                state.pending_activate = true;
             }
             zwp_input_method_v2::Event::Deactivate => {
                 state.state.active = false;
+                state.pending_activate = false;
                 state.state.reset();
                 state.events.push(InputMethodEvent::Deactivate);
             }
@@ -387,6 +396,14 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
                 });
             }
             zwp_input_method_v2::Event::Done => {
+                state.done_serial += 1;
+                state.state.serial = state.done_serial;
+                if state.pending_activate {
+                    state.pending_activate = false;
+                    state.events.push(InputMethodEvent::Activate {
+                        serial: state.done_serial,
+                    });
+                }
                 state.events.push(InputMethodEvent::Done);
             }
             zwp_input_method_v2::Event::Unavailable => {
