@@ -1,21 +1,28 @@
-//! macOS Input Method implementation
+//! macOS Input Method — IMK engine mode + CGEvent fallback
 //!
-//! This module implements IME functionality using CoreGraphics CGEvent
-//! for text injection on macOS.
+//! ## Engine mode (`new_as_engine`)
+//! Call this from your `IMKInputController` subclass. The system passes an
+//! `id<IMKTextInput>` client pointer; engine mode uses `insertText:replacementRange:`
+//! and `setMarkedText:selectedRange:replacementRange:` for proper preedit support
+//! without Accessibility permissions.
 //!
-//! Note: Using CGEvent requires accessibility permissions.
-//! The user will be prompted to grant access on first use.
+//! ## Standalone mode (`new`)
+//! Falls back to `CGEvent`-based key injection, which requires Accessibility
+//! permissions. Preedit is not supported in standalone mode.
+//!
+//! Full IMK integration requires your binary to be packaged as an Input Method
+//! bundle (`/Library/Input Methods/`) with an appropriate `Info.plist`.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
 
-use objc2::rc::Retained;
-use objc2_app_kit::{NSApplication, NSEvent, NSEventType};
-use objc2_foundation::MainThreadMarker;
+use objc2::msg_send;
+use objc2::runtime::AnyObject;
+use objc2_foundation::{NSRange, NSString};
 
 use crate::{Error, InputMethodEvent, InputMethodState, Result};
 
-// CoreGraphics FFI for CGEvent
+// CoreGraphics FFI for standalone mode fallback
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGEventCreateKeyboardEvent(
@@ -28,210 +35,167 @@ extern "C" {
     fn CFRelease(cf: *mut c_void);
 }
 
-// Carbon virtual key codes
-const K_VK_DELETE: u16 = 0x33; // Backspace
+const K_VK_DELETE: u16 = 0x33;
 const K_VK_FORWARD_DELETE: u16 = 0x75;
-
-// CGEventTapLocation
 const K_CG_HID_EVENT_TAP: u32 = 0;
 
-/// macOS input method implementation using CGEvent
+enum Mode {
+    /// IMK engine mode — raw pointer to `id<IMKTextInput>` client.
+    ///
+    /// The pointer is valid for the lifetime of the `IMKInputController`
+    /// session; callers must ensure the controller outlives this struct.
+    Engine { client: *mut AnyObject },
+    /// Standalone CGEvent fallback.
+    CgEvent,
+}
+
+// SAFETY: AnyObject pointers are safe to move across threads when guarded
+// by ObjC retain semantics; callers are responsible for keeping the client alive.
+unsafe impl Send for Mode {}
+unsafe impl Sync for Mode {}
+
 pub struct InputMethod {
+    mode: Mode,
     active: bool,
     serial: u32,
     state: InputMethodState,
     events: VecDeque<InputMethodEvent>,
-    /// Main thread marker for AppKit
-    #[allow(dead_code)]
-    mtm: Option<MainThreadMarker>,
 }
 
 impl InputMethod {
-    /// Create a new input method instance
-    ///
-    /// Note: Using CGEvent for text injection requires accessibility permissions.
+    /// Standalone mode — uses `CGEvent` injection (requires Accessibility permissions).
     pub fn new() -> Result<Self> {
-        // Try to get the main thread marker for event handling
-        let mtm = MainThreadMarker::new();
-
         Ok(Self {
-            active: true, // Always active on macOS since we use CGEvent
+            mode: Mode::CgEvent,
+            active: true,
             serial: 0,
             state: InputMethodState::new(),
             events: VecDeque::new(),
-            mtm,
         })
     }
 
-    /// Get the next event by polling NSApplication events
+    /// IMK engine mode — call from `IMKInputController initWithServer:delegate:client:`.
+    ///
+    /// `client` must be an `id<IMKTextInput>` retained by the caller.
+    pub fn new_as_engine(client: *mut AnyObject) -> Self {
+        Self {
+            mode: Mode::Engine { client },
+            active: true,
+            serial: 0,
+            state: InputMethodState::new(),
+            events: VecDeque::new(),
+        }
+    }
+
     pub fn next_event(&mut self) -> Option<InputMethodEvent> {
-        // First return any queued events
-        if let Some(event) = self.events.pop_front() {
-            return Some(event);
-        }
-
-        // Try to get events from NSApplication if we have main thread access
-        if let Some(mtm) = self.mtm {
-            // Safety: We verified we're on the main thread
-            let app = NSApplication::sharedApplication(mtm);
-
-            // Poll for events (non-blocking)
-            // Use a very short timeout to avoid blocking
-            loop {
-                let event: Option<Retained<NSEvent>> = unsafe {
-                    app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                        objc2_app_kit::NSEventMask::Any,
-                        None, // No wait
-                        objc2_foundation::NSDefaultRunLoopMode,
-                        true,
-                    )
-                };
-
-                match event {
-                    Some(ns_event) => {
-                        // Convert NSEvent to InputMethodEvent if applicable
-                        if let Some(ime_event) = self.convert_ns_event(&ns_event) {
-                            return Some(ime_event);
-                        }
-                        // Continue polling if this event wasn't IME-related
-                    }
-                    None => break, // No more events
-                }
-            }
-        }
-
-        None
+        self.events.pop_front()
     }
 
-    /// Convert NSEvent to InputMethodEvent
-    fn convert_ns_event(&mut self, ns_event: &NSEvent) -> Option<InputMethodEvent> {
-        let event_type = ns_event.r#type();
-
-        match event_type {
-            NSEventType::KeyDown => {
-                // Check for text input events
-                if let Some(characters) = ns_event.characters() {
-                    let text = characters.to_string();
-                    if !text.is_empty() {
-                        // This is a text input event
-                        if !self.state.active {
-                            self.state.active = true;
-                            self.serial += 1;
-                            return Some(InputMethodEvent::Activate {
-                                serial: self.serial,
-                            });
-                        }
-                    }
-                }
-                None
-            }
-            NSEventType::FlagsChanged => {
-                // Modifier key changes might indicate IME state changes
-                None
-            }
-            _ => None,
-        }
-    }
-
-    /// Check if active
     pub fn is_active(&self) -> bool {
         self.active
     }
 
-    /// Commit text using CGEvent keyboard simulation
+    /// Commit text.
+    ///
+    /// Engine mode: `insertText:replacementRange:` on the IMK client.
+    /// Standalone mode: `CGEvent` Unicode injection.
     pub fn commit_string(&self, text: &str) -> Result<()> {
-        // Convert text to UTF-16 for CGEvent
-        let utf16: Vec<u16> = text.encode_utf16().collect();
-
-        // Send text via CGEvent
-        unsafe {
-            // Create a keyboard event with a dummy keycode (we'll override with Unicode)
-            let event = CGEventCreateKeyboardEvent(std::ptr::null(), 0, true);
-            if event.is_null() {
-                return Err(Error::CommitFailed(
-                    "Failed to create keyboard event".to_string(),
-                ));
+        match self.mode {
+            Mode::Engine { client } => {
+                let ns_str = NSString::from_str(text);
+                // NSNotFound (usize::MAX) signals no replacement range — insert at cursor.
+                let range = NSRange { location: usize::MAX, length: 0 };
+                unsafe {
+                    let _: () = msg_send![client, insertText: &*ns_str, replacementRange: range];
+                }
+                Ok(())
             }
+            Mode::CgEvent => self.cg_commit(text),
+        }
+    }
 
-            // Set the Unicode string for this event
-            CGEventKeyboardSetUnicodeString(event, utf16.len() as u64, utf16.as_ptr());
-
-            // Post the event
-            CGEventPost(K_CG_HID_EVENT_TAP, event);
-            CFRelease(event);
-
-            // Key up event
-            let event_up = CGEventCreateKeyboardEvent(std::ptr::null(), 0, false);
-            if !event_up.is_null() {
-                CGEventKeyboardSetUnicodeString(event_up, utf16.len() as u64, utf16.as_ptr());
-                CGEventPost(K_CG_HID_EVENT_TAP, event_up);
-                CFRelease(event_up);
+    /// Set preedit / marked text.
+    ///
+    /// Engine mode: `setMarkedText:selectedRange:replacementRange:` on the IMK client.
+    /// Standalone mode: no-op (CGEvent has no preedit channel).
+    pub fn set_preedit_string(&self, text: &str, cursor_begin: i32, cursor_end: i32) -> Result<()> {
+        match self.mode {
+            Mode::Engine { client } => {
+                let ns_str = NSString::from_str(text);
+                let sel_range = NSRange {
+                    location: cursor_begin.max(0) as usize,
+                    length: (cursor_end - cursor_begin).max(0) as usize,
+                };
+                let repl_range = NSRange { location: usize::MAX, length: 0 };
+                unsafe {
+                    let _: () = msg_send![
+                        client,
+                        setMarkedText: &*ns_str,
+                        selectedRange: sel_range,
+                        replacementRange: repl_range
+                    ];
+                }
+                Ok(())
+            }
+            Mode::CgEvent => {
+                log_debug!("preedit not supported in CGEvent mode — package as IMK bundle");
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
-    /// Set preedit string (marked text)
-    pub fn set_preedit_string(
-        &self,
-        _text: &str,
-        _cursor_begin: i32,
-        _cursor_end: i32,
-    ) -> Result<()> {
-        // Preedit requires integration with the active text view via NSTextInputClient
-        // This is more complex and requires knowing the target application
-        log_debug!("Preedit not fully supported in macOS CGEvent mode - would need NSTextInputClient integration");
-        Ok(())
-    }
-
-    /// Delete surrounding text using native key events
+    /// Delete surrounding text via `CGEvent` backspace/forward-delete keys.
     pub fn delete_surrounding_text(&self, before: u32, after: u32) -> Result<()> {
         unsafe {
-            // Delete before cursor with backspace
             for _ in 0..before {
-                // Key down
-                let event = CGEventCreateKeyboardEvent(std::ptr::null(), K_VK_DELETE, true);
-                if !event.is_null() {
-                    CGEventPost(K_CG_HID_EVENT_TAP, event);
-                    CFRelease(event);
-                }
-                // Key up
-                let event_up = CGEventCreateKeyboardEvent(std::ptr::null(), K_VK_DELETE, false);
-                if !event_up.is_null() {
-                    CGEventPost(K_CG_HID_EVENT_TAP, event_up);
-                    CFRelease(event_up);
-                }
+                cg_key(K_VK_DELETE);
             }
-
-            // Delete after cursor with forward delete
             for _ in 0..after {
-                // Key down
-                let event = CGEventCreateKeyboardEvent(std::ptr::null(), K_VK_FORWARD_DELETE, true);
-                if !event.is_null() {
-                    CGEventPost(K_CG_HID_EVENT_TAP, event);
-                    CFRelease(event);
-                }
-                // Key up
-                let event_up =
-                    CGEventCreateKeyboardEvent(std::ptr::null(), K_VK_FORWARD_DELETE, false);
-                if !event_up.is_null() {
-                    CGEventPost(K_CG_HID_EVENT_TAP, event_up);
-                    CFRelease(event_up);
-                }
+                cg_key(K_VK_FORWARD_DELETE);
             }
         }
-
         Ok(())
     }
 
-    /// Commit changes (no-op for macOS as commits are immediate)
     pub fn commit(&self, _serial: u32) -> Result<()> {
         Ok(())
     }
 
-    /// Get the current state
     pub fn state(&self) -> InputMethodState {
         self.state.clone()
+    }
+
+    fn cg_commit(&self, text: &str) -> Result<()> {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            let ev = CGEventCreateKeyboardEvent(std::ptr::null(), 0, true);
+            if ev.is_null() {
+                return Err(Error::CommitFailed("CGEventCreateKeyboardEvent failed".into()));
+            }
+            CGEventKeyboardSetUnicodeString(ev, utf16.len() as u64, utf16.as_ptr());
+            CGEventPost(K_CG_HID_EVENT_TAP, ev);
+            CFRelease(ev);
+
+            let ev_up = CGEventCreateKeyboardEvent(std::ptr::null(), 0, false);
+            if !ev_up.is_null() {
+                CGEventKeyboardSetUnicodeString(ev_up, utf16.len() as u64, utf16.as_ptr());
+                CGEventPost(K_CG_HID_EVENT_TAP, ev_up);
+                CFRelease(ev_up);
+            }
+        }
+        Ok(())
+    }
+}
+
+unsafe fn cg_key(vk: u16) {
+    let ev = CGEventCreateKeyboardEvent(std::ptr::null(), vk, true);
+    if !ev.is_null() {
+        CGEventPost(K_CG_HID_EVENT_TAP, ev);
+        CFRelease(ev);
+    }
+    let ev_up = CGEventCreateKeyboardEvent(std::ptr::null(), vk, false);
+    if !ev_up.is_null() {
+        CGEventPost(K_CG_HID_EVENT_TAP, ev_up);
+        CFRelease(ev_up);
     }
 }
