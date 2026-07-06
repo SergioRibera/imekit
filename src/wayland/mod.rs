@@ -9,5 +9,5 @@
 mod input_method;
 mod text_input;
 
-pub use input_method::InputMethod;
+pub use input_method::{InputMethod, InputMethodHandle};
 pub use text_input::{TextInput, TextInputEvent};

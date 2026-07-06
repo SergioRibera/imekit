@@ -136,6 +136,17 @@ pub enum PreeditStyle {
     Incorrect,
 }
 
+/// Status of the input method
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// Input method is active (focused on a text field)
+    Active,
+    /// Input method is inactive (no text field focused)
+    Inactive,
+    /// Compositor withdrew the input method; cannot be used until reconnected
+    Unavailable,
+}
+
 /// Rectangle for cursor/anchor positioning
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CursorRect {

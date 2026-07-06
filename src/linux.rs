@@ -65,6 +65,12 @@ impl InputMethod {
         Ok(InputMethod::Wayland(im))
     }
 
+    /// Create a Wayland input method bound to a specific seat
+    pub fn wayland_for_seat(seat_name: &str) -> Result<Self> {
+        let im = wayland::InputMethod::new_for_seat(seat_name)?;
+        Ok(InputMethod::Wayland(im))
+    }
+
     /// Create an X11 input method explicitly
     pub fn x11() -> Result<Self> {
         let im = x11::InputMethod::new()?;
@@ -161,6 +167,36 @@ impl InputMethod {
             InputMethod::X11(im) => im.state(),
             #[cfg(feature = "ibus")]
             InputMethod::IBus(im) => im.state(),
+        }
+    }
+
+    /// Get a `Send`-safe handle for committing text from another thread (Wayland only)
+    pub fn handle(&self) -> Option<crate::wayland_impl::InputMethodHandle> {
+        match self {
+            InputMethod::Wayland(im) => Some(im.handle()),
+            _ => None,
+        }
+    }
+
+    /// Returns true if the Wayland compositor has withdrawn this input method
+    pub fn is_unavailable(&self) -> bool {
+        match self {
+            InputMethod::Wayland(im) => im.is_unavailable(),
+            _ => false,
+        }
+    }
+
+    /// Returns the current operational status
+    pub fn status(&self) -> crate::Status {
+        match self {
+            InputMethod::Wayland(im) => im.status(),
+            InputMethod::X11(im) => {
+                if im.is_active() { crate::Status::Active } else { crate::Status::Inactive }
+            }
+            #[cfg(feature = "ibus")]
+            InputMethod::IBus(im) => {
+                if im.is_active() { crate::Status::Active } else { crate::Status::Inactive }
+            }
         }
     }
 }

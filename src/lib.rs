@@ -128,7 +128,7 @@ impl DisplayServer {
 // Re-export Wayland-specific types (always available on Linux for building)
 #[cfg(target_os = "linux")]
 pub mod wayland_impl {
-    pub use super::wayland::{InputMethod as WaylandInputMethod, TextInput, TextInputEvent};
+    pub use super::wayland::{InputMethod as WaylandInputMethod, InputMethodHandle, TextInput, TextInputEvent};
 }
 
 // Re-export X11-specific types
