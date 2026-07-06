@@ -80,6 +80,9 @@ mod error;
 mod types;
 
 #[cfg(target_os = "linux")]
+mod linux_xtest;
+
+#[cfg(target_os = "linux")]
 mod wayland;
 
 #[cfg(target_os = "linux")]
