@@ -139,7 +139,8 @@ impl InputMethod {
             .reply()
             .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
-        let new_focus = if focus.focus != 0 {
+        // 0 = None, 1 = PointerRoot (input follows pointer, not a real window)
+        let new_focus = if focus.focus > 1 {
             Some(focus.focus)
         } else {
             None
