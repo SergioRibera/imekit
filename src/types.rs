@@ -34,7 +34,7 @@ pub enum InputMethodEvent {
     PopupSurfaceCreated {
         /// X position relative to cursor
         x: i32,
-        /// Y position relative to cursor  
+        /// Y position relative to cursor
         y: i32,
         /// Width of the text cursor area
         width: i32,
@@ -43,6 +43,42 @@ pub enum InputMethodEvent {
     },
     /// Unavailable - compositor doesn't support protocol
     Unavailable,
+    /// Key event from keyboard grab
+    KeyEvent {
+        /// Raw Linux evdev keycode (XKB keycode = this + 8)
+        keycode: u32,
+        /// XKB keysym resolved from keycode + current modifier state
+        keysym: u32,
+        /// Physical key state
+        state: KeyState,
+        /// Active modifier keys at the time of the event
+        modifiers: Modifiers,
+    },
+    /// Keyboard repeat rate and delay from the compositor
+    RepeatInfo {
+        /// Repeat rate in characters per second (0 = no repeat)
+        rate: i32,
+        /// Delay before repeat starts in milliseconds
+        delay: i32,
+    },
+}
+
+/// Physical key state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    Pressed,
+    Released,
+}
+
+/// Active modifier keys
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub caps: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub logo: bool,
+    pub num: bool,
 }
 
 /// Cause of a text change

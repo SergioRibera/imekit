@@ -100,6 +100,9 @@ mod macos;
 pub use error::{Error, Result};
 pub use types::*;
 
+#[cfg(target_os = "linux")]
+pub use wayland_impl::PopupSurface;
+
 /// The display server being used on Linux
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +131,13 @@ impl DisplayServer {
 // Re-export Wayland-specific types (always available on Linux for building)
 #[cfg(target_os = "linux")]
 pub mod wayland_impl {
-    pub use super::wayland::{InputMethod as WaylandInputMethod, InputMethodHandle, TextInput, TextInputEvent};
+    pub use super::wayland::{
+        InputMethod as WaylandInputMethod, InputMethodHandle, PopupSurface, TextInput,
+        TextInputEvent,
+    };
+
+    #[cfg(feature = "async")]
+    pub use super::wayland::InputMethodStream;
 }
 
 // Re-export X11-specific types

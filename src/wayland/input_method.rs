@@ -4,51 +4,80 @@
 //! The protocol allows applications to act as input methods.
 
 use std::collections::VecDeque;
+use std::os::unix::io::{AsFd, AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
 use wayland_client::{
-    protocol::{wl_registry, wl_seat},
+    protocol::{wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_surface},
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_keyboard_grab_v2, zwp_input_method_manager_v2, zwp_input_method_v2,
     zwp_input_popup_surface_v2,
 };
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
+};
+use xkbcommon::xkb;
 
 use crate::{
-    ChangeCause, ContentHint, ContentPurpose, Error, InputMethodEvent, InputMethodState, Result,
+    ChangeCause, ContentHint, ContentPurpose, Error, InputMethodEvent, InputMethodState, KeyState,
+    Modifiers, Result,
 };
+
+// SAFETY: xkbcommon types wrap raw C pointers but libxkbcommon does not share
+// objects across threads. InputMethodData lives behind Arc<Mutex<>>, so only one
+// thread accesses it at a time — satisfying xkbcommon's single-owner contract.
+struct XkbWrapper<T>(T);
+unsafe impl<T> Send for XkbWrapper<T> {}
 
 /// Wayland input method implementation using zwp_input_method_v2
 pub struct InputMethod {
-    connection: Connection,
+    pub(super) connection: Connection,
     event_queue: EventQueue<InputMethodData>,
     data: Arc<Mutex<InputMethodData>>,
+}
+
+/// A popup surface for rendering candidate windows.
+///
+/// Obtained via [`InputMethod::create_popup_surface`]. The compositor sends
+/// [`InputMethodEvent::PopupSurfaceCreated`] events carrying the position.
+/// Drop to destroy the popup.
+pub struct PopupSurface {
+    surface: wl_surface::WlSurface,
+    _popup: zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
+}
+
+impl PopupSurface {
+    /// The underlying `wl_surface` — render candidate UI into this.
+    pub fn surface(&self) -> &wl_surface::WlSurface {
+        &self.surface
+    }
 }
 
 /// Internal data for the input method
 #[allow(dead_code)]
 pub struct InputMethodData {
-    /// Input method manager
     manager: Option<zwp_input_method_manager_v2::ZwpInputMethodManagerV2>,
-    /// Available seats (proxy, optional name)
     seats: Vec<(wl_seat::WlSeat, Option<String>)>,
-    /// The input method instance
     input_method: Option<zwp_input_method_v2::ZwpInputMethodV2>,
-    /// Keyboard grab
     keyboard_grab: Option<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2>,
-    /// Popup surface
-    popup_surface: Option<zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2>,
-    /// Current state
     state: InputMethodState,
-    /// Pending events
     events: VecDeque<InputMethodEvent>,
-    /// Count of `done` events received — must match the serial passed to `commit()`
     done_serial: u32,
-    /// True between an `activate` event and the following `done` event
     pending_activate: bool,
-    /// True once the compositor has sent Unavailable
     unavailable: bool,
+    // compositor for popup surface creation
+    compositor: Option<wl_compositor::WlCompositor>,
+    // xkb state for keyboard grab keysym resolution
+    xkb_ctx: XkbWrapper<xkb::Context>,
+    xkb_state: Option<XkbWrapper<xkb::State>>,
+    current_modifiers: Modifiers,
+    last_key_time: u32,
+    // virtual keyboard for forwarding grabbed keys back to apps
+    virtual_keyboard_manager: Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
+    virtual_keyboard: Option<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1>,
+    keymap_sent_to_vkb: bool,
 }
 
 impl Default for InputMethodData {
@@ -58,12 +87,19 @@ impl Default for InputMethodData {
             seats: Vec::new(),
             input_method: None,
             keyboard_grab: None,
-            popup_surface: None,
             state: InputMethodState::new(),
             events: VecDeque::new(),
             done_serial: 0,
             pending_activate: false,
             unavailable: false,
+            compositor: None,
+            xkb_ctx: XkbWrapper(xkb::Context::new(0)),
+            xkb_state: None,
+            current_modifiers: Modifiers::default(),
+            last_key_time: 0,
+            virtual_keyboard_manager: None,
+            virtual_keyboard: None,
+            keymap_sent_to_vkb: false,
         }
     }
 }
@@ -125,10 +161,7 @@ impl InputMethodHandle {
 }
 
 impl InputMethod {
-    /// Create a new input method instance
-    ///
-    /// This connects to the Wayland display and binds to the
-    /// `zwp_input_method_manager_v2` global.
+    /// Create a new input method instance connecting to the default Wayland display.
     pub fn new() -> Result<Self> {
         let connection = Connection::connect_to_env()?;
         let display = connection.display();
@@ -137,13 +170,10 @@ impl InputMethod {
         let mut event_queue = connection.new_event_queue();
         let qh = event_queue.handle();
 
-        // Get the registry and enumerate globals
         display.get_registry(&qh, ());
 
-        // Do a roundtrip to get the globals
         event_queue.roundtrip(&mut *data.lock().unwrap())?;
 
-        // Check if we got the manager
         {
             let data = data.lock().unwrap();
             if data.manager.is_none() {
@@ -156,27 +186,26 @@ impl InputMethod {
             }
         }
 
-        // Create the input method
         {
-            let mut data_guard = data.lock().unwrap();
-            let seat = data_guard.seats.first().map(|(s, _)| s.clone());
-            if let (Some(manager), Some(seat)) = (&data_guard.manager, seat) {
-                let im = manager.get_input_method(&seat, &qh, ());
-                data_guard.input_method = Some(im);
+            let mut d = data.lock().unwrap();
+            let seat = d.seats.first().map(|(s, _)| s.clone());
+            let manager = d.manager.clone();
+            let vkm = d.virtual_keyboard_manager.clone();
+
+            if let (Some(m), Some(s)) = (manager, seat.clone()) {
+                d.input_method = Some(m.get_input_method(&s, &qh, ()));
+            }
+            if let (Some(m), Some(s)) = (vkm, seat) {
+                d.virtual_keyboard = Some(m.create_virtual_keyboard(&s, &qh, ()));
             }
         }
 
-        // Another roundtrip to setup the input method
         event_queue.roundtrip(&mut *data.lock().unwrap())?;
 
-        Ok(Self {
-            connection,
-            event_queue,
-            data,
-        })
+        Ok(Self { connection, event_queue, data })
     }
 
-    /// Create an input method bound to a specific seat (for multi-seat setups)
+    /// Create an input method bound to a specific seat (for multi-seat setups).
     pub fn new_for_seat(seat_name: &str) -> Result<Self> {
         let connection = Connection::connect_to_env()?;
         let display = connection.display();
@@ -187,10 +216,8 @@ impl InputMethod {
 
         display.get_registry(&qh, ());
 
-        // First roundtrip: get globals and bind seats
+        // Two roundtrips: first binds globals, second receives seat names.
         event_queue.roundtrip(&mut *data.lock().unwrap())?;
-
-        // Second roundtrip: receive seat names
         event_queue.roundtrip(&mut *data.lock().unwrap())?;
 
         {
@@ -203,8 +230,8 @@ impl InputMethod {
         }
 
         {
-            let mut data_guard = data.lock().unwrap();
-            let seat = data_guard
+            let mut d = data.lock().unwrap();
+            let seat = d
                 .seats
                 .iter()
                 .find(|(_, name)| name.as_deref() == Some(seat_name))
@@ -212,33 +239,28 @@ impl InputMethod {
                 .ok_or_else(|| {
                     Error::ConnectionFailed(format!("seat '{}' not found", seat_name))
                 })?;
+            let manager = d.manager.clone();
+            let vkm = d.virtual_keyboard_manager.clone();
 
-            if let Some(manager) = &data_guard.manager {
-                let im = manager.get_input_method(&seat, &qh, ());
-                data_guard.input_method = Some(im);
+            if let Some(m) = manager {
+                d.input_method = Some(m.get_input_method(&seat, &qh, ()));
+            }
+            if let Some(m) = vkm {
+                d.virtual_keyboard = Some(m.create_virtual_keyboard(&seat, &qh, ()));
             }
         }
 
         event_queue.roundtrip(&mut *data.lock().unwrap())?;
 
-        Ok(Self {
-            connection,
-            event_queue,
-            data,
-        })
+        Ok(Self { connection, event_queue, data })
     }
 
-    /// Get the next event from the input method
-    ///
-    /// This dispatches pending Wayland events and returns the next
-    /// input method event if available.
+    /// Get the next event from the input method without blocking.
     pub fn next_event(&mut self) -> Option<InputMethodEvent> {
-        // Dispatch pending events
         let _ = self
             .event_queue
             .dispatch_pending(&mut *self.data.lock().unwrap());
 
-        // Try to get more events
         if let Some(guard) = self.connection.prepare_read() {
             if let Err(e) = guard.read() {
                 log_warn!("Wayland connection read error: {}", e);
@@ -248,23 +270,92 @@ impl InputMethod {
             .event_queue
             .dispatch_pending(&mut *self.data.lock().unwrap());
 
-        // Return the next event
         self.data.lock().unwrap().events.pop_front()
     }
 
-    /// Dispatch events (blocking)
+    /// Dispatch events (blocking).
     pub fn dispatch(&mut self) -> Result<()> {
         self.event_queue
             .blocking_dispatch(&mut *self.data.lock().unwrap())?;
         Ok(())
     }
 
-    /// Check if the input method is active
+    /// Raw file descriptor of the Wayland socket.
+    ///
+    /// Register this in your own poller (epoll, kqueue, etc.) to drive the
+    /// input method without polling. When it becomes readable, call
+    /// [`next_event`](Self::next_event) or [`dispatch`](Self::dispatch).
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.connection.as_fd().as_raw_fd()
+    }
+
+    /// Create a popup surface for rendering candidate windows.
+    ///
+    /// The returned [`PopupSurface`] owns the `wl_surface`; drop it to
+    /// destroy the popup. The compositor will start sending
+    /// [`InputMethodEvent::PopupSurfaceCreated`] events with position info.
+    pub fn create_popup_surface(&mut self) -> Result<PopupSurface> {
+        let qh = self.event_queue.handle();
+        let d = self.data.lock().unwrap();
+
+        let compositor = d
+            .compositor
+            .clone()
+            .ok_or_else(|| Error::ProtocolNotSupported("wl_compositor not available".to_string()))?;
+        let im = d
+            .input_method
+            .clone()
+            .ok_or(Error::NotActive)?;
+
+        drop(d);
+
+        let surface = compositor.create_surface(&qh, ());
+        let popup = im.get_input_popup_surface(&surface, &qh, ());
+
+        Ok(PopupSurface { surface, _popup: popup })
+    }
+
+    /// Grab the keyboard — key events are then delivered as
+    /// [`InputMethodEvent::KeyEvent`].
+    pub fn grab_keyboard(&mut self) -> Result<()> {
+        let mut data = self.data.lock().unwrap();
+        if let Some(im) = &data.input_method {
+            let qh = self.event_queue.handle();
+            let grab = im.grab_keyboard(&qh, ());
+            data.keyboard_grab = Some(grab);
+            return Ok(());
+        }
+        Err(Error::NotActive)
+    }
+
+    /// Forward a grabbed key back to the focused application via virtual keyboard.
+    ///
+    /// Requires a previous call to [`grab_keyboard`](Self::grab_keyboard) and
+    /// compositor support for `zwp_virtual_keyboard_manager_v1`. Uses the
+    /// timestamp from the most recent key event.
+    pub fn forward_key(&self, keycode: u32, state: KeyState) -> Result<()> {
+        let data = self.data.lock().unwrap();
+        let vk = data.virtual_keyboard.as_ref().ok_or(Error::NotActive)?;
+        if !data.keymap_sent_to_vkb {
+            return Err(Error::NotActive);
+        }
+        let state_u32 = match state {
+            KeyState::Pressed => 1u32,
+            KeyState::Released => 0u32,
+        };
+        vk.key(data.last_key_time, keycode, state_u32);
+        drop(data);
+        self.connection
+            .flush()
+            .map_err(|e| Error::CommitFailed(e.to_string()))
+    }
+
+    /// Check if the input method is active.
     pub fn is_active(&self) -> bool {
         self.data.lock().unwrap().state.active
     }
 
-    /// Commit text to the client
+    /// Commit text to the client.
     pub fn commit_string(&self, text: &str) -> Result<()> {
         let data = self.data.lock().unwrap();
         if let Some(im) = &data.input_method {
@@ -274,7 +365,7 @@ impl InputMethod {
         Err(Error::NotActive)
     }
 
-    /// Set preedit text (composing text shown to user)
+    /// Set preedit text (composing text shown to user).
     pub fn set_preedit_string(&self, text: &str, cursor_begin: i32, cursor_end: i32) -> Result<()> {
         let data = self.data.lock().unwrap();
         if let Some(im) = &data.input_method {
@@ -284,7 +375,7 @@ impl InputMethod {
         Err(Error::NotActive)
     }
 
-    /// Delete surrounding text
+    /// Delete surrounding text.
     pub fn delete_surrounding_text(&self, before_length: u32, after_length: u32) -> Result<()> {
         let data = self.data.lock().unwrap();
         if let Some(im) = &data.input_method {
@@ -294,7 +385,7 @@ impl InputMethod {
         Err(Error::NotActive)
     }
 
-    /// Commit all pending changes
+    /// Commit all pending changes.
     pub fn commit(&self, serial: u32) -> Result<()> {
         {
             let data = self.data.lock().unwrap();
@@ -309,19 +400,7 @@ impl InputMethod {
             .map_err(|e| Error::CommitFailed(e.to_string()))
     }
 
-    /// Grab the keyboard
-    pub fn grab_keyboard(&mut self) -> Result<()> {
-        let mut data = self.data.lock().unwrap();
-        if let Some(im) = &data.input_method {
-            let qh = self.event_queue.handle();
-            let grab = im.grab_keyboard(&qh, ());
-            data.keyboard_grab = Some(grab);
-            return Ok(());
-        }
-        Err(Error::NotActive)
-    }
-
-    /// Get the current state
+    /// Get the current state.
     pub fn state(&self) -> InputMethodState {
         let data = self.data.lock().unwrap();
         InputMethodState {
@@ -341,12 +420,12 @@ impl InputMethod {
         }
     }
 
-    /// Returns true if the compositor has withdrawn this input method
+    /// Returns true if the compositor has withdrawn this input method.
     pub fn is_unavailable(&self) -> bool {
         self.data.lock().unwrap().unavailable
     }
 
-    /// Returns the current operational status
+    /// Returns the current operational status.
     pub fn status(&self) -> crate::Status {
         let data = self.data.lock().unwrap();
         if data.unavailable {
@@ -358,7 +437,16 @@ impl InputMethod {
         }
     }
 
-    /// Get a clone-able handle for sending commits from other threads
+    /// Convert into an async [`InputMethodStream`].
+    ///
+    /// Requires the `async` feature. The stream yields events as they arrive
+    /// from the compositor without blocking the executor thread.
+    #[cfg(feature = "async")]
+    pub fn into_stream(self) -> std::io::Result<super::async_stream::InputMethodStream> {
+        super::async_stream::InputMethodStream::new(self)
+    }
+
+    /// Get a clone-able handle for sending commits from other threads.
     pub fn handle(&self) -> InputMethodHandle {
         InputMethodHandle {
             data: Arc::clone(&self.data),
@@ -367,7 +455,10 @@ impl InputMethod {
     }
 }
 
-// Helper to parse content hint from raw u32 value
+// ---------------------------------------------------------------------------
+// Helper parsers
+// ---------------------------------------------------------------------------
+
 fn parse_content_hint(hint_raw: u32) -> ContentHint {
     ContentHint {
         completion: hint_raw & 0x1 != 0,
@@ -383,7 +474,6 @@ fn parse_content_hint(hint_raw: u32) -> ContentHint {
     }
 }
 
-// Helper to parse content purpose from WEnum
 fn parse_content_purpose(
     purpose: WEnum<
         wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ContentPurpose,
@@ -408,7 +498,10 @@ fn parse_content_purpose(
     }
 }
 
-// Registry dispatch
+// ---------------------------------------------------------------------------
+// Dispatch impls
+// ---------------------------------------------------------------------------
+
 impl Dispatch<wl_registry::WlRegistry, ()> for InputMethodData {
     fn event(
         state: &mut Self,
@@ -418,26 +511,42 @@ impl Dispatch<wl_registry::WlRegistry, ()> for InputMethodData {
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
+        if let wl_registry::Event::Global { name, interface, version } = event {
             match interface.as_str() {
                 "zwp_input_method_manager_v2" => {
-                    let manager = registry
-                        .bind::<zwp_input_method_manager_v2::ZwpInputMethodManagerV2, _, _>(
+                    state.manager = Some(
+                        registry.bind::<zwp_input_method_manager_v2::ZwpInputMethodManagerV2, _, _>(
                             name,
                             version.min(1),
                             qh,
                             (),
-                        );
-                    state.manager = Some(manager);
+                        ),
+                    );
                 }
                 "wl_seat" => {
-                    let seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(8), qh, ());
+                    let seat =
+                        registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(8), qh, ());
                     state.seats.push((seat, None));
+                }
+                "wl_compositor" => {
+                    state.compositor = Some(
+                        registry.bind::<wl_compositor::WlCompositor, _, _>(
+                            name,
+                            version.min(5),
+                            qh,
+                            (),
+                        ),
+                    );
+                }
+                "zwp_virtual_keyboard_manager_v1" => {
+                    state.virtual_keyboard_manager = Some(
+                        registry.bind::<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1, _, _>(
+                            name,
+                            version.min(1),
+                            qh,
+                            (),
+                        ),
+                    );
                 }
                 _ => {}
             }
@@ -445,7 +554,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for InputMethodData {
     }
 }
 
-// Seat dispatch
 impl Dispatch<wl_seat::WlSeat, ()> for InputMethodData {
     fn event(
         state: &mut Self,
@@ -463,21 +571,68 @@ impl Dispatch<wl_seat::WlSeat, ()> for InputMethodData {
     }
 }
 
-// Input method manager dispatch
 impl Dispatch<zwp_input_method_manager_v2::ZwpInputMethodManagerV2, ()> for InputMethodData {
     fn event(
-        _state: &mut Self,
-        _manager: &zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
-        _event: zwp_input_method_manager_v2::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        _: &mut Self,
+        _: &zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
+        _: zwp_input_method_manager_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
     ) {
-        // No events for the manager
     }
 }
 
-// Input method dispatch
+impl Dispatch<wl_compositor::WlCompositor, ()> for InputMethodData {
+    fn event(
+        _: &mut Self,
+        _: &wl_compositor::WlCompositor,
+        _: wl_compositor::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_surface::WlSurface, ()> for InputMethodData {
+    fn event(
+        _: &mut Self,
+        _: &wl_surface::WlSurface,
+        _: wl_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1, ()>
+    for InputMethodData
+{
+    fn event(
+        _: &mut Self,
+        _: &zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+        _: zwp_virtual_keyboard_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1, ()> for InputMethodData {
+    fn event(
+        _: &mut Self,
+        _: &zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+        _: zwp_virtual_keyboard_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
     fn event(
         state: &mut Self,
@@ -498,19 +653,11 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
                 state.state.reset();
                 state.events.push_back(InputMethodEvent::Deactivate);
             }
-            zwp_input_method_v2::Event::SurroundingText {
-                text,
-                cursor,
-                anchor,
-            } => {
+            zwp_input_method_v2::Event::SurroundingText { text, cursor, anchor } => {
                 state.state.surrounding_text = Some(text.clone());
                 state.state.cursor = cursor;
                 state.state.anchor = anchor;
-                state.events.push_back(InputMethodEvent::SurroundingText {
-                    text,
-                    cursor,
-                    anchor,
-                });
+                state.events.push_back(InputMethodEvent::SurroundingText { text, cursor, anchor });
             }
             zwp_input_method_v2::Event::TextChangeCause { cause } => {
                 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ChangeCause as WlChangeCause;
@@ -522,14 +669,12 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
                 state.events.push_back(InputMethodEvent::TextChangeCause(cause));
             }
             zwp_input_method_v2::Event::ContentType { hint, purpose } => {
-                // hint is WEnum<ContentHint> - we need to extract raw value
                 let hint_raw = match hint {
                     WEnum::Value(h) => h.bits(),
                     WEnum::Unknown(v) => v,
                 };
                 let content_hint = parse_content_hint(hint_raw);
                 let content_purpose = parse_content_purpose(purpose);
-
                 state.state.content_hint = content_hint;
                 state.state.content_purpose = content_purpose;
                 state.events.push_back(InputMethodEvent::ContentType {
@@ -542,9 +687,9 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
                 state.state.serial = state.done_serial;
                 if state.pending_activate {
                     state.pending_activate = false;
-                    state.events.push_back(InputMethodEvent::Activate {
-                        serial: state.done_serial,
-                    });
+                    state
+                        .events
+                        .push_back(InputMethodEvent::Activate { serial: state.done_serial });
                 }
                 state.events.push_back(InputMethodEvent::Done);
             }
@@ -557,23 +702,118 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for InputMethodData {
     }
 }
 
-// Keyboard grab dispatch
 impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, ()>
     for InputMethodData
 {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _grab: &zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
-        _event: zwp_input_method_keyboard_grab_v2::Event,
+        event: zwp_input_method_keyboard_grab_v2::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        // Handle keyboard events if needed
+        match event {
+            zwp_input_method_keyboard_grab_v2::Event::Keymap { format, fd, size } => {
+                // Dup fd before consuming it so the same keymap can be forwarded
+                // to the virtual keyboard for transparent key forwarding.
+                let vkb_fd = if state.virtual_keyboard.is_some() {
+                    fd.as_fd().try_clone_to_owned().ok()
+                } else {
+                    None
+                };
+
+                if matches!(format, WEnum::Value(wl_keyboard::KeymapFormat::XkbV1)) {
+                    match unsafe {
+                        xkb::Keymap::new_from_fd(
+                            &state.xkb_ctx.0,
+                            fd,
+                            size as usize,
+                            xkb::KEYMAP_FORMAT_TEXT_V1,
+                            xkb::KEYMAP_COMPILE_NO_FLAGS,
+                        )
+                    } {
+                        Ok(Some(keymap)) => {
+                            state.xkb_state = Some(XkbWrapper(xkb::State::new(&keymap)));
+                        }
+                        _ => {
+                            log_warn!("Failed to parse XKB keymap from compositor");
+                        }
+                    }
+                }
+
+                if let (Some(vk), Some(vkb_fd)) = (&state.virtual_keyboard, vkb_fd) {
+                    // 1 = XKB_KEYMAP_FORMAT_TEXT_V1
+                    vk.keymap(1, vkb_fd.as_fd(), size);
+                    state.keymap_sent_to_vkb = true;
+                }
+            }
+
+            zwp_input_method_keyboard_grab_v2::Event::Key { serial: _, time, key, state: key_state } => {
+                state.last_key_time = time;
+
+                if let Some(xkb_state) = &state.xkb_state {
+                    // Wayland keycodes are evdev codes; XKB adds 8.
+                    let keycode = xkb::Keycode::new(key + 8);
+                    let keysym = xkb_state.0.key_get_one_sym(keycode).raw();
+
+                    let ks = match key_state {
+                        WEnum::Value(wl_keyboard::KeyState::Pressed) => KeyState::Pressed,
+                        _ => KeyState::Released,
+                    };
+
+                    state.events.push_back(InputMethodEvent::KeyEvent {
+                        keycode: key,
+                        keysym,
+                        state: ks,
+                        modifiers: state.current_modifiers,
+                    });
+                }
+            }
+
+            zwp_input_method_keyboard_grab_v2::Event::Modifiers {
+                serial: _,
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+            } => {
+                if let Some(xkb_state) = &mut state.xkb_state {
+                    xkb_state.0.update_mask(
+                        mods_depressed,
+                        mods_latched,
+                        mods_locked,
+                        0,
+                        0,
+                        group,
+                    );
+                    let s = &xkb_state.0;
+                    state.current_modifiers = Modifiers {
+                        shift: s.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE),
+                        caps: s.mod_name_is_active(xkb::MOD_NAME_CAPS, xkb::STATE_MODS_EFFECTIVE),
+                        ctrl: s.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE),
+                        alt: s.mod_name_is_active(xkb::MOD_NAME_ALT, xkb::STATE_MODS_EFFECTIVE),
+                        logo: s.mod_name_is_active(xkb::MOD_NAME_LOGO, xkb::STATE_MODS_EFFECTIVE),
+                        num: s.mod_name_is_active(xkb::MOD_NAME_NUM, xkb::STATE_MODS_EFFECTIVE),
+                    };
+                }
+
+                if let Some(vk) = &state.virtual_keyboard {
+                    if state.keymap_sent_to_vkb {
+                        vk.modifiers(mods_depressed, mods_latched, mods_locked, group);
+                    }
+                }
+            }
+
+            zwp_input_method_keyboard_grab_v2::Event::RepeatInfo { rate, delay } => {
+                state.events.push_back(InputMethodEvent::RepeatInfo { rate, delay });
+            }
+
+            _ => {}
+        }
     }
 }
 
-// Popup surface dispatch
 impl Dispatch<zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2, ()> for InputMethodData {
     fn event(
         state: &mut Self,
@@ -583,19 +823,12 @@ impl Dispatch<zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2, ()> for InputM
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let zwp_input_popup_surface_v2::Event::TextInputRectangle {
-            x,
-            y,
-            width,
-            height,
-        } = event
+        if let zwp_input_popup_surface_v2::Event::TextInputRectangle { x, y, width, height } =
+            event
         {
-            state.events.push_back(InputMethodEvent::PopupSurfaceCreated {
-                x,
-                y,
-                width,
-                height,
-            });
+            state
+                .events
+                .push_back(InputMethodEvent::PopupSurfaceCreated { x, y, width, height });
         }
     }
 }

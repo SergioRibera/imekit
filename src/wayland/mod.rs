@@ -9,5 +9,11 @@
 mod input_method;
 mod text_input;
 
-pub use input_method::{InputMethod, InputMethodHandle};
+#[cfg(feature = "async")]
+mod async_stream;
+
+pub use input_method::{InputMethod, InputMethodHandle, PopupSurface};
 pub use text_input::{TextInput, TextInputEvent};
+
+#[cfg(feature = "async")]
+pub use async_stream::InputMethodStream;

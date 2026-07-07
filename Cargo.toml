@@ -15,6 +15,7 @@ default = []
 log = ["dep:log"]
 tracing = ["dep:tracing"]
 ibus = ["zbus"]
+async = ["dep:futures-core", "dep:async-io"]
 
 [[example]]
 name = "basic_ime"
@@ -27,6 +28,8 @@ path = "examples/commit_text.rs"
 [dependencies]
 log = { version = "0.4", optional = true }
 tracing = { version = "0.1", optional = true }
+futures-core = { version = "0.3", optional = true }
+async-io = { version = "2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = "0.31"
@@ -34,6 +37,7 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 x11rb = { version = "0.13", features = ["allow-unsafe-code", "xtest"] }
 zbus = { version = "5", optional = true }
+xkbcommon = "0.7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.59", features = [
