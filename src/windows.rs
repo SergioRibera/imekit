@@ -1,13 +1,16 @@
 //! Windows Input Method implementation
 //!
-//! Text injection via `SendInput`; preedit via IMM32 `ImmSetCompositionStringW`.
-//! A proper TSF `ITfTextInputProcessor` requires a registered COM text service (DLL).
-//! That architecture is outside this library's scope; `SendInput` is the correct
-//! in-process approach for an embedded IME library.
+//! Commit: TSF `ITfInsertAtSelection` (falls back to `SendInput`).
+//! Preedit: TSF `ITfContextComposition` + `ITfRange::SetText` (falls back to IMM32).
+//! Events: Win32 message queue `WM_IME_*` messages.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::UI::Input::Ime::{
     ImmGetContext, ImmReleaseContext, ImmSetCompositionStringW, HIMC, SCS_SETSTR,
 };
@@ -15,12 +18,194 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, VIRTUAL_KEY,
 };
+use windows::Win32::UI::TextServices::{
+    CLSID_TF_ThreadMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
+    ITfContext, ITfContextComposition, ITfEditSession, ITfEditSession_Impl,
+    ITfInsertAtSelection, ITfRange, ITfThreadMgr,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetForegroundWindow, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
 };
+use windows::core::{implement, PCWSTR, Result as WinResult};
 
 use crate::{Error, InputMethodEvent, InputMethodState, Result};
+
+// TF_ES_* and TF_IAS_* constants (not always re-exported by windows-rs).
+const TF_ES_SYNC: u32 = 0x1;
+const TF_ES_READWRITE: u32 = 0x6;
+// InsertTextAtSelection: query the insertion range without inserting text.
+const TF_IAS_QUERYONLY: u32 = 0x2;
+
+// ── COM: direct commit (no active composition) ─────────────────────────────
+
+#[implement(ITfEditSession)]
+struct CommitSession {
+    text: Vec<u16>,
+    context: ITfContext,
+}
+
+impl ITfEditSession_Impl for CommitSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> WinResult<()> {
+        unsafe {
+            let ins: ITfInsertAtSelection = self.context.cast()?;
+            let mut _range: Option<ITfRange> = None;
+            ins.InsertTextAtSelection(
+                ec,
+                0,
+                PCWSTR(self.text.as_ptr()),
+                self.text.len() as i32,
+                &mut _range,
+            )
+        }
+    }
+}
+
+// ── COM: commit while a preedit composition is active ─────────────────────
+
+#[implement(ITfEditSession)]
+struct CommitCompositionSession {
+    text: Vec<u16>,
+    composition: ITfComposition,
+}
+
+impl ITfEditSession_Impl for CommitCompositionSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> WinResult<()> {
+        unsafe {
+            let range = self.composition.GetRange()?;
+            range.SetText(ec, 0, PCWSTR(self.text.as_ptr()), self.text.len() as i32)?;
+            self.composition.EndComposition(ec)
+        }
+    }
+}
+
+// ── COM: start a new preedit composition ──────────────────────────────────
+//
+// `out` is a raw pointer to a stack-local `Option<ITfComposition>` owned by
+// the caller. Safe because `TF_ES_SYNC` guarantees DoEditSession returns
+// before RequestEditSession does, keeping the pointee alive throughout.
+
+struct WriteBack(*mut Option<ITfComposition>);
+unsafe impl Send for WriteBack {}
+unsafe impl Sync for WriteBack {}
+
+#[implement(ITfEditSession)]
+struct StartPreeditSession {
+    text: Vec<u16>,
+    context: ITfContext,
+    out: WriteBack,
+}
+
+impl ITfEditSession_Impl for StartPreeditSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> WinResult<()> {
+        unsafe {
+            // Query the insertion point without inserting anything.
+            let ins: ITfInsertAtSelection = self.context.cast()?;
+            let mut range: Option<ITfRange> = None;
+            let empty: [u16; 1] = [0];
+            ins.InsertTextAtSelection(
+                ec,
+                TF_IAS_QUERYONLY,
+                PCWSTR(empty.as_ptr()),
+                0,
+                &mut range,
+            )?;
+            let range = match range {
+                Some(r) => r,
+                None => return Ok(()),
+            };
+
+            let comp_ctx: ITfContextComposition = self.context.cast()?;
+            let sink: ITfCompositionSink = NullCompositionSink.into();
+            let mut new_comp: Option<ITfComposition> = None;
+            comp_ctx.StartComposition(ec, &range, &sink, &mut new_comp)?;
+
+            if let Some(comp) = &new_comp {
+                let comp_range = comp.GetRange()?;
+                comp_range.SetText(
+                    ec,
+                    0,
+                    PCWSTR(self.text.as_ptr()),
+                    self.text.len() as i32,
+                )?;
+            }
+
+            *self.out.0 = new_comp;
+            Ok(())
+        }
+    }
+}
+
+// ── COM: update text of an existing preedit composition ───────────────────
+
+#[implement(ITfEditSession)]
+struct UpdatePreeditSession {
+    text: Vec<u16>,
+    composition: ITfComposition,
+}
+
+impl ITfEditSession_Impl for UpdatePreeditSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> WinResult<()> {
+        unsafe {
+            let range = self.composition.GetRange()?;
+            range.SetText(ec, 0, PCWSTR(self.text.as_ptr()), self.text.len() as i32)
+        }
+    }
+}
+
+// ── COM: minimal composition sink ─────────────────────────────────────────
+
+#[implement(ITfCompositionSink)]
+struct NullCompositionSink;
+
+impl ITfCompositionSink_Impl for NullCompositionSink_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        _ec_write: u32,
+        _p_composition: &ITfComposition,
+    ) -> WinResult<()> {
+        Ok(())
+    }
+}
+
+// ── TSF state ──────────────────────────────────────────────────────────────
+
+struct TsfState {
+    thread_mgr: ITfThreadMgr,
+    client_id: u32,
+}
+
+impl TsfState {
+    fn init() -> Option<Self> {
+        unsafe {
+            // S_FALSE (1) means COM already initialised on this thread — fine.
+            let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            if hr.is_err() {
+                return None;
+            }
+            let tm: ITfThreadMgr =
+                CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).ok()?;
+            let mut tid: u32 = 0;
+            tm.Activate(&mut tid).ok()?;
+            Some(Self { thread_mgr: tm, client_id: tid })
+        }
+    }
+
+    fn focused_context(&self) -> Option<ITfContext> {
+        unsafe {
+            let doc = self.thread_mgr.GetFocus().ok()?;
+            doc.GetTop().ok()
+        }
+    }
+
+    fn request_sync_rw(&self, ctx: &ITfContext, session: &ITfEditSession) -> bool {
+        unsafe {
+            ctx.RequestEditSession(self.client_id, session, TF_ES_SYNC | TF_ES_READWRITE).is_ok()
+        }
+    }
+}
+
+// ── InputMethod ────────────────────────────────────────────────────────────
 
 pub struct InputMethod {
     active: bool,
@@ -28,6 +213,9 @@ pub struct InputMethod {
     state: InputMethodState,
     events: VecDeque<InputMethodEvent>,
     composing: bool,
+    tsf: Option<TsfState>,
+    /// Active TSF preedit composition, if any.
+    composition: RefCell<Option<ITfComposition>>,
 }
 
 impl InputMethod {
@@ -38,6 +226,8 @@ impl InputMethod {
             state: InputMethodState::new(),
             events: VecDeque::new(),
             composing: false,
+            tsf: TsfState::init(),
+            composition: RefCell::new(None),
         })
     }
 
@@ -100,22 +290,110 @@ impl InputMethod {
         unsafe { GetForegroundWindow() }
     }
 
-    /// Commit text via `SendInput` Unicode events.
     pub fn commit_string(&self, text: &str) -> Result<()> {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+
+        // Path A: an active composition is in progress — update its text and end it.
+        if let Some(comp) = self.composition.borrow_mut().take() {
+            if let Some(tsf) = &self.tsf {
+                if let Some(ctx) = tsf.focused_context() {
+                    let session: ITfEditSession = CommitCompositionSession {
+                        text: wide.clone(),
+                        composition: comp,
+                    }
+                    .into();
+                    if tsf.request_sync_rw(&ctx, &session) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Path B: no composition — insert directly at the current selection.
+        if let Some(tsf) = &self.tsf {
+            if let Some(ctx) = tsf.focused_context() {
+                let session: ITfEditSession =
+                    CommitSession { text: wide.clone(), context: ctx.clone() }.into();
+                if tsf.request_sync_rw(&ctx, &session) {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback: SendInput Unicode simulation.
+        self.send_input_string(&wide)
+    }
+
+    pub fn set_preedit_string(
+        &self,
+        text: &str,
+        _cursor_begin: i32,
+        _cursor_end: i32,
+    ) -> Result<()> {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+
+        // Update existing composition range; if that fails, use IMM32 directly.
+        if let Some(comp) = self.composition.borrow().as_ref().map(|c| c.clone()) {
+            if let Some(tsf) = &self.tsf {
+                if let Some(ctx) = tsf.focused_context() {
+                    let session: ITfEditSession =
+                        UpdatePreeditSession { text: wide.clone(), composition: comp }.into();
+                    if tsf.request_sync_rw(&ctx, &session) {
+                        return Ok(());
+                    }
+                }
+            }
+            return self.imm32_set_preedit(&wide);
+        }
+
+        // Start a new composition.
+        if let Some(tsf) = &self.tsf {
+            if let Some(ctx) = tsf.focused_context() {
+                let mut new_comp: Option<ITfComposition> = None;
+                let session: ITfEditSession = StartPreeditSession {
+                    text: wide.clone(),
+                    context: ctx.clone(),
+                    out: WriteBack(&mut new_comp as *mut _),
+                }
+                .into();
+                if tsf.request_sync_rw(&ctx, &session) {
+                    *self.composition.borrow_mut() = new_comp;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback: IMM32.
+        self.imm32_set_preedit(&wide)
+    }
+
+    fn imm32_set_preedit(&self, wide: &[u16]) -> Result<()> {
         let hwnd = Self::foreground_window();
         if hwnd.0.is_null() {
             return Err(Error::NotActive);
         }
-        for c in text.chars() {
-            let cp = c as u32;
-            if cp <= 0xFFFF {
-                self.send_unicode_char(cp as u16)?;
-            } else {
-                let high = ((cp - 0x10000) >> 10) as u16 + 0xD800;
-                let low = ((cp - 0x10000) & 0x3FF) as u16 + 0xDC00;
-                self.send_unicode_char(high)?;
-                self.send_unicode_char(low)?;
+        unsafe {
+            let himc = ImmGetContext(hwnd);
+            if himc == HIMC(std::ptr::null_mut()) {
+                log_debug!("ImmGetContext returned null — IMM not available for this window");
+                return Ok(());
             }
+            let _ = ImmSetCompositionStringW(
+                himc,
+                SCS_SETSTR,
+                Some(wide.as_ptr() as _),
+                (wide.len() * 2) as u32,
+                None,
+                0,
+            );
+            ImmReleaseContext(hwnd, himc);
+        }
+        Ok(())
+    }
+
+    fn send_input_string(&self, wide: &[u16]) -> Result<()> {
+        for &code in wide {
+            self.send_unicode_char(code)?;
         }
         Ok(())
     }
@@ -184,34 +462,6 @@ impl InputMethod {
         let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
         if sent != inputs.len() as u32 {
             return Err(Error::CommitFailed("SendInput failed".to_string()));
-        }
-        Ok(())
-    }
-
-    /// Set preedit via IMM32 `ImmSetCompositionStringW`.
-    ///
-    /// Works for IMM-compatible apps. TSF-only apps ignore IMM composition.
-    pub fn set_preedit_string(&self, text: &str, _cursor_begin: i32, _cursor_end: i32) -> Result<()> {
-        let hwnd = Self::foreground_window();
-        if hwnd.0.is_null() {
-            return Err(Error::NotActive);
-        }
-        unsafe {
-            let himc = ImmGetContext(hwnd);
-            if himc == HIMC(std::ptr::null_mut()) {
-                log_debug!("ImmGetContext returned null — IMM not available for this window");
-                return Ok(());
-            }
-            let wide: Vec<u16> = text.encode_utf16().collect();
-            let _ = ImmSetCompositionStringW(
-                himc,
-                SCS_SETSTR,
-                Some(wide.as_ptr() as _),
-                (wide.len() * 2) as u32,
-                None,
-                0,
-            );
-            ImmReleaseContext(hwnd, himc);
         }
         Ok(())
     }
