@@ -1,6 +1,6 @@
 [package]
 name = "imekit"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Sergio Ribera"]
 license = "MIT OR Apache-2.0"
@@ -49,6 +49,9 @@ windows = { version = "0.59", features = [
     "Win32_UI_TextServices",
     "Win32_System_Com",
 ] }
+# Required: the #[implement] macro in windows 0.59 emits `::windows_core::...`
+# paths at the call site, so windows_core must be a direct dep of this crate.
+windows-core = "0.59"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
