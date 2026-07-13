@@ -19,23 +19,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_UNICODE, VIRTUAL_KEY,
 };
 use windows::Win32::UI::TextServices::{
-    CLSID_TF_ThreadMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
-    ITfContext, ITfContextComposition, ITfEditSession, ITfEditSession_Impl,
-    ITfInsertAtSelection, ITfRange, ITfThreadMgr,
+    CLSID_TF_ThreadMgr, INSERT_TEXT_AT_SELECTION_FLAGS, ITfComposition, ITfCompositionSink,
+    ITfCompositionSink_Impl, ITfContext, ITfContextComposition, ITfEditSession,
+    ITfEditSession_Impl, ITfInsertAtSelection, ITfThreadMgr, TF_ES_READWRITE, TF_ES_SYNC,
+    TF_IAS_QUERYONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetForegroundWindow, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
 };
-use windows::core::{implement, PCWSTR, Result as WinResult};
+use windows::core::{implement, Interface, Ref, Result as WinResult};
 
 use crate::{Error, InputMethodEvent, InputMethodState, Result};
-
-// TF_ES_* and TF_IAS_* constants (not always re-exported by windows-rs).
-const TF_ES_SYNC: u32 = 0x1;
-const TF_ES_READWRITE: u32 = 0x6;
-// InsertTextAtSelection: query the insertion range without inserting text.
-const TF_IAS_QUERYONLY: u32 = 0x2;
 
 // ── COM: direct commit (no active composition) ─────────────────────────────
 
@@ -49,14 +44,8 @@ impl ITfEditSession_Impl for CommitSession_Impl {
     fn DoEditSession(&self, ec: u32) -> WinResult<()> {
         unsafe {
             let ins: ITfInsertAtSelection = self.context.cast()?;
-            let mut _range: Option<ITfRange> = None;
-            ins.InsertTextAtSelection(
-                ec,
-                0,
-                PCWSTR(self.text.as_ptr()),
-                self.text.len() as i32,
-                &mut _range,
-            )
+            ins.InsertTextAtSelection(ec, INSERT_TEXT_AT_SELECTION_FLAGS(0), &self.text)?;
+            Ok(())
         }
     }
 }
@@ -73,7 +62,7 @@ impl ITfEditSession_Impl for CommitCompositionSession_Impl {
     fn DoEditSession(&self, ec: u32) -> WinResult<()> {
         unsafe {
             let range = self.composition.GetRange()?;
-            range.SetText(ec, 0, PCWSTR(self.text.as_ptr()), self.text.len() as i32)?;
+            range.SetText(ec, 0, &self.text)?;
             self.composition.EndComposition(ec)
         }
     }
@@ -101,36 +90,14 @@ impl ITfEditSession_Impl for StartPreeditSession_Impl {
         unsafe {
             // Query the insertion point without inserting anything.
             let ins: ITfInsertAtSelection = self.context.cast()?;
-            let mut range: Option<ITfRange> = None;
-            let empty: [u16; 1] = [0];
-            ins.InsertTextAtSelection(
-                ec,
-                TF_IAS_QUERYONLY,
-                PCWSTR(empty.as_ptr()),
-                0,
-                &mut range,
-            )?;
-            let range = match range {
-                Some(r) => r,
-                None => return Ok(()),
-            };
+            let range = ins.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[])?;
 
             let comp_ctx: ITfContextComposition = self.context.cast()?;
             let sink: ITfCompositionSink = NullCompositionSink.into();
-            let mut new_comp: Option<ITfComposition> = None;
-            comp_ctx.StartComposition(ec, &range, &sink, &mut new_comp)?;
+            let new_comp = comp_ctx.StartComposition(ec, &range, &sink)?;
+            new_comp.GetRange()?.SetText(ec, 0, &self.text)?;
 
-            if let Some(comp) = &new_comp {
-                let comp_range = comp.GetRange()?;
-                comp_range.SetText(
-                    ec,
-                    0,
-                    PCWSTR(self.text.as_ptr()),
-                    self.text.len() as i32,
-                )?;
-            }
-
-            *self.out.0 = new_comp;
+            *self.out.0 = Some(new_comp);
             Ok(())
         }
     }
@@ -148,7 +115,7 @@ impl ITfEditSession_Impl for UpdatePreeditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> WinResult<()> {
         unsafe {
             let range = self.composition.GetRange()?;
-            range.SetText(ec, 0, PCWSTR(self.text.as_ptr()), self.text.len() as i32)
+            range.SetText(ec, 0, &self.text)
         }
     }
 }
@@ -162,7 +129,7 @@ impl ITfCompositionSink_Impl for NullCompositionSink_Impl {
     fn OnCompositionTerminated(
         &self,
         _ec_write: u32,
-        _p_composition: &ITfComposition,
+        _p_composition: Ref<'_, ITfComposition>,
     ) -> WinResult<()> {
         Ok(())
     }
@@ -185,8 +152,7 @@ impl TsfState {
             }
             let tm: ITfThreadMgr =
                 CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).ok()?;
-            let mut tid: u32 = 0;
-            tm.Activate(&mut tid).ok()?;
+            let tid = tm.Activate().ok()?;
             Some(Self { thread_mgr: tm, client_id: tid })
         }
     }
